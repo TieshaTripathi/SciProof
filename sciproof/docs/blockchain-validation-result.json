@@ -1,0 +1,13 @@
+{
+  "runtime": "Anvil local EVM",
+  "chain_id": 31337,
+  "contract_deployed": true,
+  "actual_transaction_receipt": true,
+  "confirmations_required": 3,
+  "confirmation_depth_enforced": true,
+  "confirmation_rollback_detected": true,
+  "scientific_report_preserved": true,
+  "receipt_removal_detected": true,
+  "same_signed_transaction_rebroadcast": true,
+  "validated_at_utc": "2026-10-07T20:18:12.791581+00:00"
+}

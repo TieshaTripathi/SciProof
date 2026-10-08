@@ -1,0 +1,13 @@
+# Encrypted storage and public publication
+
+`ArtifactStorage` covers put/get/delete/exists/metadata/stream. The default local adapter and optional S3 adapter retain application-level Fernet encryption for all visibility classes. S3 writes use conditional `IfNoneMatch=*` to preserve object immutability; the compatible server must support this condition. Test adapters exercise the exact request boundary without live credentials. Deployment credentials use boto3's normal credential chain and are never persisted in artifact metadata.
+
+Both adapters authenticate a complete bounded object and verify its original SHA-256 before releasing plaintext. Streaming divides authenticated plaintext into chunks; Fernet is not incremental encryption. This implementation supports bounded 20 MB artifacts, not arbitrary-size streams. Delete exists for rollback/reconciliation; no user API deletes sealed scientific artifacts. S3 deletion can be disabled by policy.
+
+Visibility does not trigger publication. `POST /artifacts/{id}/publish` requires an authenticated owner, `PUBLIC` visibility and `confirm_publication: true`. PRIVATE and RESTRICTED requests fail before contacting the provider. Scientific verification never calls publication. Changing a sealed artifact's visibility is not supported: create a new version with deliberately public content instead.
+
+Publication records retain the original hash, provider, state, CID and local receipt timestamp. States are NOT_PUBLISHED, PUBLISHING, PUBLISHED and FAILED. A returned valid CID is a provider receipt, not independent proof that a gateway serves the bytes indefinitely. No guarantee of permanent availability is made. The adapter accepts canonical CIDv0 and base32 CIDv1 with SHA-256 dag-pb/raw codecs; other encodings/codecs require an explicit extension. The CID differs from the original raw-file SHA-256 when DAG encoding is involved.
+
+If a process dies after remote pinning and before saving the receipt, its PUBLISHING audit needs operator reconciliation; automatic retry could create additional provider pin records. External timeout can also leave remotely pinned content despite a FAILED local receipt. A later deliberate retry is safe for immutable bytes but may incur provider cost. PUBLIC publication cannot reliably be revoked from all IPFS peers.
+
+Local tests inject S3 and HTTP transports. Live S3/Pinata validation remains a credential-dependent deployment gate. Implementation references: [AWS conditional object upload](https://docs.aws.amazon.com/boto3/latest/reference/services/s3/client/put_object.html), [Pinata file pinning](https://docs.pinata.cloud/api-reference/endpoint/ipfs/pin-file-to-ipfs), [IPFS content identifiers](https://docs.ipfs.tech/concepts/content-addressing/).

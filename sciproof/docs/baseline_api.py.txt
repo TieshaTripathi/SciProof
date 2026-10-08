@@ -1,0 +1,133 @@
+import io, os, uuid, json, hashlib, sqlite3, logging
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+import pandas as pd
+from pypdf import PdfReader
+from argon2 import PasswordHasher
+from cryptography.fernet import Fernet
+from fastapi import FastAPI, Depends, HTTPException, Request, Response, UploadFile, File
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+from packages.verification.engine import verify, canonical_hash
+from packages.ai.provider import LocalProvider, PROMPT_VERSION
+
+root=Path(os.getenv('STORAGE_ROOT','private-artifacts')); root.mkdir(parents=True,exist_ok=True)
+key=os.getenv('STORAGE_ENCRYPTION_KEY')
+if not key:
+    keyfile=root/'.key'
+    if not keyfile.exists(): keyfile.write_bytes(Fernet.generate_key())
+    key=keyfile.read_bytes()
+cipher=Fernet(key)
+DB=os.getenv('DATABASE_PATH','sciproof.db')
+with sqlite3.connect(DB) as db:
+    db.execute('CREATE TABLE IF NOT EXISTS records (id TEXT PRIMARY KEY, kind TEXT, owner TEXT, parent TEXT, payload TEXT)')
+    db.execute('CREATE UNIQUE INDEX IF NOT EXISTS unique_email ON records(parent) WHERE kind="user"')
+def save(kind,owner,payload,parent=None):
+    rid=str(uuid.uuid4())
+    with sqlite3.connect(DB) as db: db.execute('INSERT INTO records VALUES (?,?,?,?,?)',(rid,kind,owner,parent,json.dumps(payload,allow_nan=False)))
+    return {'id':rid,**payload}
+def records(kind,owner=None,parent=None):
+    with sqlite3.connect(DB) as db:
+        rows=db.execute('SELECT id,owner,payload FROM records WHERE kind=? AND (? IS NULL OR owner=?) AND (? IS NULL OR parent=?)',(kind,owner,owner,parent,parent)).fetchall()
+    return [{'id':r[0],'owner':r[1],**json.loads(r[2])} for r in rows]
+def owned(rid,uid,kind):
+    match=next((r for r in records(kind,uid) if r['id']==rid),None)
+    if not match: raise HTTPException(404,'Not found')
+    return match
+app=FastAPI(title='SciProof')
+logging.basicConfig(level=logging.INFO)
+origin=os.getenv('WEB_ORIGIN','http://localhost:3000')
+app.add_middleware(CORSMiddleware,allow_origins=[origin],allow_credentials=True,allow_methods=['GET','POST'],allow_headers=['Content-Type'])
+@app.middleware('http')
+async def request_id(request,call_next):
+    rid=str(uuid.uuid4()); response=await call_next(request); response.headers['X-Request-ID']=rid
+    logging.getLogger('sciproof').info(json.dumps({'request_id':rid,'path':request.url.path,'status':response.status_code}))
+    return response
+def user(request:Request):
+    if request.method=='POST' and request.headers.get('origin') not in (None,origin): raise HTTPException(403,'Invalid origin')
+    digest=hashlib.sha256(request.cookies.get('session','').encode()).hexdigest()
+    sessions=records('session',parent=digest)
+    if not sessions or sessions[0]['expires']<datetime.now(timezone.utc).isoformat(): raise HTTPException(401,'Sign in required')
+    return sessions[0]['owner']
+class Credentials(BaseModel):
+    email:str=Field(min_length=3,max_length=254)
+    password:str=Field(min_length=12,max_length=128)
+ph=PasswordHasher()
+@app.post('/auth/signup')
+def signup(c:Credentials):
+    try: save('user','',{'password_hash':ph.hash(c.password)},c.email.strip().lower())
+    except sqlite3.IntegrityError: raise HTTPException(409,'Account exists')
+    return {'ok':True}
+@app.post('/auth/login')
+def login(c:Credentials,response:Response):
+    matches=records('user',parent=c.email.strip().lower())
+    try:
+        if not matches: raise ValueError()
+        ph.verify(matches[0]['password_hash'],c.password)
+    except Exception: raise HTTPException(401,'Invalid credentials')
+    token=uuid.uuid4().hex+uuid.uuid4().hex
+    save('session',matches[0]['id'],{'expires':(datetime.now(timezone.utc)+timedelta(hours=8)).isoformat()},hashlib.sha256(token.encode()).hexdigest())
+    response.set_cookie('session',token,httponly=True,samesite='lax',secure=os.getenv('SECURE_COOKIES')=='true',max_age=28800)
+    return {'ok':True}
+class Project(BaseModel):
+    title:str=Field(min_length=1,max_length=200)
+@app.post('/auth/logout')
+def logout(request:Request,response:Response,uid=Depends(user)):
+    digest=hashlib.sha256(request.cookies.get('session','').encode()).hexdigest()
+    with sqlite3.connect(DB) as db: db.execute('DELETE FROM records WHERE kind=? AND owner=? AND parent=?',('session',uid,digest))
+    response.delete_cookie('session'); return {'ok':True}
+@app.get('/projects')
+def projects(uid=Depends(user)): return records('project',uid)
+@app.post('/projects')
+def create_project(p:Project,uid=Depends(user)): return save('project',uid,p.model_dump())
+@app.post('/projects/{pid}/versions')
+def create_version(pid:str,uid=Depends(user)):
+    owned(pid,uid,'project'); return save('version',uid,{'research_id':pid,'created_at':datetime.now(timezone.utc).isoformat()},pid)
+@app.post('/versions/{vid}/artifacts/{kind}')
+async def upload(vid:str,kind:str,file:UploadFile=File(...),uid=Depends(user)):
+    owned(vid,uid,'version')
+    if records('run',uid,vid): raise HTTPException(409,'Verified versions are immutable; create a new version')
+    allowed={'manuscript':{'.pdf'},'dataset':{'.csv','.json','.parquet'},'analysis':{'.py','.ipynb'}}
+    name=file.filename or ''; ext=Path(name).suffix.lower()
+    if '/' in name or '\\' in name or '..' in name or len(name)>200: raise HTTPException(400,'Unsafe filename')
+    if kind not in allowed or ext not in allowed[kind]: raise HTTPException(400,'Unsupported format')
+    raw=await file.read(20*1024*1024+1)
+    if len(raw)>20*1024*1024: raise HTTPException(413,'20 MB maximum')
+    try:
+        if ext=='.pdf':
+            if not raw.startswith(b'%PDF-'): raise ValueError()
+            PdfReader(io.BytesIO(raw))
+        elif ext=='.parquet':
+            if not raw.startswith(b'PAR1') or not raw.endswith(b'PAR1'): raise ValueError()
+            pd.read_parquet(io.BytesIO(raw))
+        elif ext in ('.json','.ipynb'): json.loads(raw)
+        else:
+            raw.decode('utf-8')
+            if b'\x00' in raw: raise ValueError()
+            if ext=='.csv': pd.read_csv(io.BytesIO(raw))
+    except Exception: raise HTTPException(400,'Content does not match supported format')
+    artifact=save('artifact',uid,{'kind':kind,'filename':name,'extension':ext,'sha256':hashlib.sha256(raw).hexdigest(),'size':len(raw),'visibility':'PRIVATE'},vid)
+    (root/artifact['id']).write_bytes(cipher.encrypt(raw)); return artifact
+@app.post('/versions/{vid}/verify')
+def run(vid:str,uid=Depends(user)):
+    v=owned(vid,uid,'version'); artifacts=records('artifact',uid,vid); selected={a['kind']:a for a in artifacts}
+    previous=records('run',uid,vid)
+    if previous: return previous[0]
+    if not {'manuscript','dataset'}<=selected.keys(): raise HTTPException(422,'Manuscript and dataset required')
+    def content(a): return cipher.decrypt((root/a['id']).read_bytes())
+    try:
+        d=selected['dataset']; raw=io.BytesIO(content(d))
+        df=pd.read_csv(raw) if d['extension']=='.csv' else pd.read_json(raw) if d['extension']=='.json' else pd.read_parquet(raw)
+        pages=[p.extract_text() or '' for p in PdfReader(io.BytesIO(content(selected['manuscript']))).pages]
+        provider=LocalProvider(); claims=[c.model_dump() for c in provider.extract(pages,list(df.columns))]
+        report=verify(df,claims)
+    except Exception as e: raise HTTPException(422,'Parsing or verification failed') from e
+    created_at=datetime.now(timezone.utc).isoformat()
+    report.update(claims=claims,ai={'provider':provider.identifier,'prompt_version':PROMPT_VERSION,'timestamp':created_at,'structured_output':claims,'semantic_verification':'Unavailable; offline explicit extraction only','retries':0,'error':None})
+    manifest={'research_id':v['research_id'],'version_id':vid,'engine_version':'0.1.0','ruleset_version':'2026-01','ai_provider':provider.identifier,'prompt_version':PROMPT_VERSION,'created_at':created_at,'paper_sha256':selected['manuscript']['sha256'],'dataset_sha256':selected['dataset']['sha256'],'analysis_code_sha256':selected.get('analysis',{}).get('sha256'),'scores':report['scores'],'artifacts':[{'id':a['id'],'sha256':a['sha256'],'visibility':'PRIVATE','storage_reference':'protected:'+a['id']} for a in artifacts]}
+    report.update(provenance={'manifest':manifest,'provenance_hash':canonical_hash(manifest)},attestation={'status':'PENDING_CONFIGURATION','transaction_hash':None})
+    return save('run',uid,report,vid)
+@app.get('/runs/{rid}')
+def report(rid:str,uid=Depends(user)): return owned(rid,uid,'run')
+@app.get('/health')
+def health(): return {'status':'ok','sandbox':'disabled','engine_version':'0.1.0'}

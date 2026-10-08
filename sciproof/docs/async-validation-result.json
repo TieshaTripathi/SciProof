@@ -1,0 +1,15 @@
+{
+  "runtime": "Linux prefork Celery + Redis + PostgreSQL",
+  "lifecycle": [
+    "QUEUED",
+    "RUNNING",
+    "COMPLETED"
+  ],
+  "duplicate_deliveries": 3,
+  "redis_outage_recovered": true,
+  "single_completion_verified": true,
+  "signed_task_envelopes": true,
+  "forged_task_rejected_by_worker": true,
+  "scheduler_redispatch": true,
+  "validated_at_utc": "2026-10-07T20:18:12.790611+00:00"
+}
